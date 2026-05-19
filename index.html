@@ -8,7 +8,7 @@
 <meta name="apple-mobile-web-app-title" content="Maxikiosco City">
 <meta name="theme-color" content="#1e293b">
 <title>Maxikiosco City</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.0/umd/index.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f1f5f9; user-select: none; -webkit-user-select: none; }
@@ -100,8 +100,15 @@
   .fab:active { transform: scale(0.95); }
 
   /* Scanner */
-  #scanner-container { width: 100%; max-width: 400px; margin: 0 auto; border-radius: 12px; overflow: hidden; }
-  #scanner-container video { width: 100% !important; }
+  #scanner-container { width: 100%; max-width: 400px; margin: 0 auto; border-radius: 12px; overflow: hidden; position: relative; background: #000; }
+  #scanner-video { width: 100% !important; display: block; }
+  .scanner-overlay { position: absolute; inset: 0; pointer-events: none; display: flex; align-items: center; justify-content: center; }
+  .scanner-frame { width: 85%; height: 30%; border: 2px solid #f59e0b; border-radius: 12px; box-shadow: 0 0 0 9999px rgba(0,0,0,0.4); position: relative; }
+  .scanner-line { position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: #ef4444; box-shadow: 0 0 8px #ef4444; animation: scanline 1.5s ease-in-out infinite; }
+  @keyframes scanline { 0%, 100% { top: 10%; } 50% { top: 90%; } }
+  .scanner-status { text-align: center; padding: 10px; font-size: 13px; color: #94a3b8; }
+  .scanner-status.detecting { color: #fbbf24; }
+  .scanner-status.success { color: #4ade80; font-weight: 600; }
 
   /* Section title */
   .section-title { font-size: 13px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin: 16px 0 10px; padding-left: 4px; }
@@ -304,9 +311,7 @@ function openModal(html) {
 
 function closeModal() {
   document.getElementById('modal').classList.remove('active');
-  if (scanner) {
-    try { scanner.stop().then(() => { scanner.clear(); scanner = null; }); } catch(e){ scanner = null; }
-  }
+  stopScanner();
 }
 
 document.getElementById('modal').addEventListener('click', (e) => {
@@ -668,6 +673,11 @@ function handleQuickAction(action) {
 }
 
 // ============ SCANNER ============
+let zxingReader = null;
+let scannerStream = null;
+let lastScannedCode = null;
+let lastScannedTime = 0;
+
 function openScanner(callback) {
   scannerCallback = callback;
   openModal(`
@@ -675,38 +685,123 @@ function openScanner(callback) {
       <div class="modal-title">📷 Escanear código</div>
       <button class="modal-close" onclick="closeModal()">✕</button>
     </div>
-    <div id="scanner-container"></div>
-    <div style="text-align:center; color:#94a3b8; font-size:13px; margin-top:12px;">Apuntá la cámara al código de barras</div>
-    <button class="btn btn-secondary" style="margin-top:14px;" onclick="manualEntry()">⌨️ Ingresar código manualmente</button>
+    <div id="scanner-container">
+      <video id="scanner-video" playsinline muted autoplay></video>
+      <div class="scanner-overlay">
+        <div class="scanner-frame">
+          <div class="scanner-line"></div>
+        </div>
+      </div>
+    </div>
+    <div class="scanner-status" id="scanner-status">Buscando código...</div>
+    <button class="btn btn-secondary" style="margin-top:10px;" onclick="manualEntry()">⌨️ Ingresar código manualmente</button>
   `);
 
-  setTimeout(() => {
+  setTimeout(() => startZxingScanner(), 100);
+}
+
+async function startZxingScanner() {
+  const statusEl = document.getElementById('scanner-status');
+  const videoEl = document.getElementById('scanner-video');
+  if (!videoEl) return;
+
+  try {
+    // Request high-res back camera with continuous focus
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 30 },
+        focusMode: 'continuous',
+        advanced: [
+          { focusMode: 'continuous' },
+          { exposureMode: 'continuous' },
+          { whiteBalanceMode: 'continuous' }
+        ]
+      }
+    };
+
+    scannerStream = await navigator.mediaDevices.getUserMedia(constraints);
+    videoEl.srcObject = scannerStream;
+    await videoEl.play();
+
+    // Try to enable torch/continuous focus on track
+    const track = scannerStream.getVideoTracks()[0];
     try {
-      scanner = new Html5Qrcode("scanner-container");
-      const config = { fps: 10, qrbox: { width: 280, height: 140 }, aspectRatio: 1.5 };
-      scanner.start(
-        { facingMode: "environment" },
-        config,
-        (decodedText) => {
-          if (scannerCallback) {
-            const cb = scannerCallback;
-            scannerCallback = null;
-            scanner.stop().then(() => { scanner.clear(); scanner = null; cb(decodedText); });
-          }
-        },
-        () => {}
-      ).catch(err => {
-        document.getElementById('scanner-container').innerHTML = `
-          <div style="padding:20px; text-align:center; color:#f87171;">
-            ⚠️ No se pudo acceder a la cámara.<br><br>
-            <span style="color:#cbd5e1; font-size:13px;">Verificá que diste permiso de cámara en Safari. Ajustes > Safari > Cámara > Permitir.</span>
-          </div>
-        `;
-      });
-    } catch(e) {
-      console.error(e);
+      const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+      const settings = {};
+      if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) settings.focusMode = 'continuous';
+      if (capabilities.exposureMode && capabilities.exposureMode.includes('continuous')) settings.exposureMode = 'continuous';
+      if (Object.keys(settings).length) await track.applyConstraints({ advanced: [settings] });
+    } catch(e) { /* ignore */ }
+
+    // Build ZXing reader with optimized hints for product barcodes
+    const ZXing = window.ZXing;
+    if (!ZXing) {
+      statusEl.textContent = '⚠️ Error: librería no cargada';
+      return;
     }
-  }, 200);
+
+    const hints = new Map();
+    const formats = [
+      ZXing.BarcodeFormat.EAN_13,
+      ZXing.BarcodeFormat.EAN_8,
+      ZXing.BarcodeFormat.UPC_A,
+      ZXing.BarcodeFormat.UPC_E,
+      ZXing.BarcodeFormat.CODE_128,
+      ZXing.BarcodeFormat.CODE_39,
+      ZXing.BarcodeFormat.ITF
+    ];
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+
+    zxingReader = new ZXing.BrowserMultiFormatReader(hints, 100); // scan every 100ms
+
+    statusEl.textContent = '👁 Apuntá la cámara al código';
+    statusEl.className = 'scanner-status detecting';
+
+    zxingReader.decodeFromVideoElement(videoEl, (result, err) => {
+      if (result) {
+        const code = result.getText();
+        const now = Date.now();
+        // Debounce: ignore same code within 1.5s
+        if (code === lastScannedCode && (now - lastScannedTime) < 1500) return;
+        lastScannedCode = code;
+        lastScannedTime = now;
+
+        // Vibrate on successful scan
+        if (navigator.vibrate) navigator.vibrate(100);
+
+        statusEl.textContent = '✓ ' + code;
+        statusEl.className = 'scanner-status success';
+
+        if (scannerCallback) {
+          const cb = scannerCallback;
+          scannerCallback = null;
+          stopScanner();
+          setTimeout(() => cb(code), 150);
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('Scanner error:', err);
+    statusEl.innerHTML = `⚠️ No se pudo acceder a la cámara<br><span style="font-size:11px;">Ajustes > Safari > Cámara > Permitir</span>`;
+    statusEl.style.color = '#f87171';
+  }
+}
+
+function stopScanner() {
+  if (zxingReader) {
+    try { zxingReader.reset(); } catch(e){}
+    zxingReader = null;
+  }
+  if (scannerStream) {
+    scannerStream.getTracks().forEach(t => t.stop());
+    scannerStream = null;
+  }
 }
 
 function manualEntry() {
@@ -714,11 +809,8 @@ function manualEntry() {
   if (code && scannerCallback) {
     const cb = scannerCallback;
     scannerCallback = null;
-    if (scanner) {
-      try { scanner.stop().then(() => { scanner.clear(); scanner = null; cb(code); }); } catch(e){ scanner = null; cb(code); }
-    } else {
-      cb(code);
-    }
+    stopScanner();
+    cb(code);
   }
 }
 
